@@ -2951,7 +2951,7 @@ set_var_lval(lp, endp, rettv, copy, op)
 	/*
 	 * Check whether any of the list items is locked
 	 */
-	for (ri = rettv->vval.v_list->lv_first; ri != NULL; )
+	for (ri = rettv->vval.v_list->lv_first; ri != NULL && ll_li != NULL; )
 	{
 	    if (tv_check_lock(ll_li->li_tv.v_lock, lp->ll_name))
 		return;
@@ -3368,11 +3368,11 @@ set_context_for_expression(xp, arg, cmdidx)
 	    got_eq = TRUE;
 	    xp->xp_context = EXPAND_EXPRESSION;
 	}
-	else if (c == '<'
+	else if ((c == '<' || c == '#')
 		&& xp->xp_context == EXPAND_FUNCTIONS
 		&& vim_strchr(xp->xp_pattern, '(') == NULL)
 	{
-	    /* Function name can start with "<SNR>" */
+	    /* Function name can start with "<SNR>" and contain '#'. */
 	    break;
 	}
 	else if (cmdidx != CMD_let || got_eq)
@@ -6927,8 +6927,8 @@ garbage_collect()
 free_unref_items(copyID)
     int copyID;
 {
-    dict_T	*dd;
-    list_T	*ll;
+    dict_T	*dd, *dd_next;
+    list_T	*ll, *ll_next;
     int		did_free = FALSE;
 
     /*
@@ -6940,11 +6940,10 @@ free_unref_items(copyID)
 	    /* Free the Dictionary and ordinary items it contains, but don't
 	     * recurse into Lists and Dictionaries, they will be in the list
 	     * of dicts or list of lists. */
+	    dd_next = dd->dv_used_next;
 	    dict_free(dd, FALSE);
 	    did_free = TRUE;
-
-	    /* restart, next dict may also have been freed */
-	    dd = first_dict;
+	    dd = dd_next;
 	}
 	else
 	    dd = dd->dv_used_next;
@@ -6961,11 +6960,10 @@ free_unref_items(copyID)
 	    /* Free the List and ordinary items it contains, but don't recurse
 	     * into Lists and Dictionaries, they will be in the list of dicts
 	     * or list of lists. */
+	    ll_next = ll->lv_used_next;
 	    list_free(ll, FALSE);
 	    did_free = TRUE;
-
-	    /* restart, next list may also have been freed */
-	    ll = first_list;
+	    ll = ll_next;
 	}
 	else
 	    ll = ll->lv_used_next;
@@ -10720,18 +10718,20 @@ filter_map(argvars, rettv, map)
 	    {
 		if (!HASHITEM_EMPTY(hi))
 		{
+		    int r;
+
 		    --todo;
 		    di = HI2DI(hi);
 		    if (tv_check_lock(di->di_tv.v_lock,
 						     (char_u *)_(arg_errmsg)))
 			break;
 		    vimvars[VV_KEY].vv_str = vim_strsave(di->di_key);
-		    if (filter_map_one(&di->di_tv, expr, map, &rem) == FAIL
-								  || did_emsg)
+		    r = filter_map_one(&di->di_tv, expr, map, &rem);
+		    clear_tv(&vimvars[VV_KEY].vv_tv);
+		    if (r == FAIL || did_emsg)
 			break;
 		    if (!map && rem)
 			dictitem_remove(d, di);
-		    clear_tv(&vimvars[VV_KEY].vv_tv);
 		}
 	    }
 	    hash_unlock(ht);
@@ -10782,6 +10782,7 @@ filter_map_one(tv, expr, map, remp)
     if (*s != NUL)  /* check for trailing chars after expr */
     {
 	EMSG2(_(e_invexpr2), s);
+	clear_tv(&rettv);
 	goto theend;
     }
     if (map)
@@ -12008,6 +12009,8 @@ f_getreg(argvars, rettv)
 	rettv->v_type = VAR_LIST;
 	rettv->vval.v_list = (list_T *)get_reg_contents(regname,
 				      (arg2 ? GREG_EXPR_SRC : 0) | GREG_LIST);
+	if (rettv->vval.v_list != NULL)
+	    ++rettv->vval.v_list->lv_refcount;
     }
     else
     {
@@ -12071,7 +12074,8 @@ f_gettabvar(argvars, rettv)
     typval_T	*argvars;
     typval_T	*rettv;
 {
-    tabpage_T	*tp;
+    win_T	*oldcurwin;
+    tabpage_T	*tp, *oldtabpage;
     dictitem_T	*v;
     char_u	*varname;
     int		done = FALSE;
@@ -12083,13 +12087,23 @@ f_gettabvar(argvars, rettv)
     tp = find_tabpage((int)get_tv_number_chk(&argvars[0], NULL));
     if (tp != NULL && varname != NULL)
     {
-	/* look up the variable */
-	v = find_var_in_ht(&tp->tp_vars->dv_hashtab, 0, varname, FALSE);
-	if (v != NULL)
+	/* Set tp to be our tabpage, temporarily.  Also set the window to the
+	 * first window in the tabpage, otherwise the window is not valid. */
+	if (switch_win(&oldcurwin, &oldtabpage, tp->tp_firstwin, tp, TRUE)
+									== OK)
 	{
-	    copy_tv(&v->di_tv, rettv);
-	    done = TRUE;
+	    /* look up the variable */
+	    /* Let gettabvar({nr}, "") return the "t:" dictionary. */
+	    v = find_var_in_ht(&tp->tp_vars->dv_hashtab, 't', varname, FALSE);
+	    if (v != NULL)
+	    {
+		copy_tv(&v->di_tv, rettv);
+		done = TRUE;
+	    }
 	}
+
+	/* restore previous notion of curwin */
+	restore_win(oldcurwin, oldtabpage, TRUE);
     }
 
     if (!done && argvars[2].v_type != VAR_UNKNOWN)
@@ -12224,22 +12238,24 @@ getwinvar(argvars, rettv, off)
     {
 	/* Set curwin to be our win, temporarily.  Also set the tabpage,
 	 * otherwise the window is not valid. */
-	switch_win(&oldcurwin, &oldtabpage, win, tp, TRUE);
-
-	if (*varname == '&')	/* window-local-option */
+	if (switch_win(&oldcurwin, &oldtabpage, win, tp, TRUE) == OK)
 	{
-	    if (get_option_tv(&varname, rettv, 1) == OK)
-		done = TRUE;
-	}
-	else
-	{
-	    /* Look up the variable. */
-	    /* Let getwinvar({nr}, "") return the "w:" dictionary. */
-	    v = find_var_in_ht(&win->w_vars->dv_hashtab, 'w', varname, FALSE);
-	    if (v != NULL)
+	    if (*varname == '&')	/* window-local-option */
 	    {
-		copy_tv(&v->di_tv, rettv);
-		done = TRUE;
+		if (get_option_tv(&varname, rettv, 1) == OK)
+		    done = TRUE;
+	    }
+	    else
+	    {
+		/* Look up the variable. */
+		/* Let getwinvar({nr}, "") return the "w:" dictionary. */
+		v = find_var_in_ht(&win->w_vars->dv_hashtab, 'w',
+							      varname, FALSE);
+		if (v != NULL)
+		{
+		    copy_tv(&v->di_tv, rettv);
+		    done = TRUE;
+		}
 	    }
 	}
 
@@ -17243,34 +17259,33 @@ setwinvar(argvars, rettv, off)
     if (win != NULL && varname != NULL && varp != NULL)
     {
 #ifdef FEAT_WINDOWS
-	if (switch_win(&save_curwin, &save_curtab, win, tp, TRUE) == FAIL)
-	    return;
+	if (switch_win(&save_curwin, &save_curtab, win, tp, TRUE) == OK)
 #endif
-
-	if (*varname == '&')
 	{
-	    long	numval;
-	    char_u	*strval;
-	    int		error = FALSE;
-
-	    ++varname;
-	    numval = get_tv_number_chk(varp, &error);
-	    strval = get_tv_string_buf_chk(varp, nbuf);
-	    if (!error && strval != NULL)
-		set_option_value(varname, numval, strval, OPT_LOCAL);
-	}
-	else
-	{
-	    winvarname = alloc((unsigned)STRLEN(varname) + 3);
-	    if (winvarname != NULL)
+	    if (*varname == '&')
 	    {
-		STRCPY(winvarname, "w:");
-		STRCPY(winvarname + 2, varname);
-		set_var(winvarname, varp, TRUE);
-		vim_free(winvarname);
+		long	numval;
+		char_u	*strval;
+		int		error = FALSE;
+
+		++varname;
+		numval = get_tv_number_chk(varp, &error);
+		strval = get_tv_string_buf_chk(varp, nbuf);
+		if (!error && strval != NULL)
+		    set_option_value(varname, numval, strval, OPT_LOCAL);
+	    }
+	    else
+	    {
+		winvarname = alloc((unsigned)STRLEN(varname) + 3);
+		if (winvarname != NULL)
+		{
+		    STRCPY(winvarname, "w:");
+		    STRCPY(winvarname + 2, varname);
+		    set_var(winvarname, varp, TRUE);
+		    vim_free(winvarname);
+		}
 	    }
 	}
-
 #ifdef FEAT_WINDOWS
 	restore_win(save_curwin, save_curtab, TRUE);
 #endif
@@ -18626,13 +18641,16 @@ get_cmd_output_as_rettv(argvars, rettv, retlist)
 	}
 	else
 	{
+	    size_t len;
+
 	    p = get_tv_string_buf_chk(&argvars[1], buf);
 	    if (p == NULL)
 	    {
 		fclose(fd);
 		goto errret;		/* type error; errmsg already given */
 	    }
-	    if (fwrite(p, STRLEN(p), 1, fd) != 1)
+	    len = STRLEN(p);
+	    if (len > 0 && fwrite(p, len, 1, fd) != 1)
 		err = TRUE;
 	}
 	if (fclose(fd) != 0)
@@ -19561,7 +19579,7 @@ f_winrestview(argvars, rettv)
 # endif
 	changed_window_setting();
 
-	if (curwin->w_topline == 0)
+	if (curwin->w_topline <= 0)
 	    curwin->w_topline = 1;
 	if (curwin->w_topline > curbuf->b_ml.ml_line_count)
 	    curwin->w_topline = curbuf->b_ml.ml_line_count;
@@ -19674,6 +19692,7 @@ f_writefile(argvars, rettv)
     typval_T	*rettv;
 {
     int		binary = FALSE;
+    int		append = FALSE;
     char_u	*fname;
     FILE	*fd;
     int		ret = 0;
@@ -19689,14 +19708,19 @@ f_writefile(argvars, rettv)
     if (argvars[0].vval.v_list == NULL)
 	return;
 
-    if (argvars[2].v_type != VAR_UNKNOWN
-			      && STRCMP(get_tv_string(&argvars[2]), "b") == 0)
-	binary = TRUE;
+    if (argvars[2].v_type != VAR_UNKNOWN)
+    {
+	if (vim_strchr(get_tv_string(&argvars[2]), 'b') != NULL)
+	    binary = TRUE;
+	if (vim_strchr(get_tv_string(&argvars[2]), 'a') != NULL)
+	    append = TRUE;
+    }
 
     /* Always open the file in binary mode, library functions have a mind of
      * their own about CR-LF conversion. */
     fname = get_tv_string(&argvars[1]);
-    if (*fname == NUL || (fd = mch_fopen((char *)fname, WRITEBIN)) == NULL)
+    if (*fname == NUL || (fd = mch_fopen((char *)fname,
+				      append ? APPENDBIN : WRITEBIN)) == NULL)
     {
 	EMSG2(_(e_notcreate), *fname == NUL ? (char_u *)_("<empty>") : fname);
 	ret = -1;
@@ -22257,14 +22281,11 @@ ex_function(eap)
 		if (*p == '!')
 		    p = skipwhite(p + 1);
 		p += eval_fname_script(p);
-		if (ASCII_ISALPHA(*p))
+		vim_free(trans_function_name(&p, TRUE, 0, NULL));
+		if (*skipwhite(p) == '(')
 		{
-		    vim_free(trans_function_name(&p, TRUE, 0, NULL));
-		    if (*skipwhite(p) == '(')
-		    {
-			++nesting;
-			indent += 2;
-		    }
+		    ++nesting;
+		    indent += 2;
 		}
 	    }
 
@@ -24739,7 +24760,7 @@ repeat:
 	    p = alloc(_MAX_PATH + 1);
 	    if (p != NULL)
 	    {
-		if (GetLongPathName(*fnamep, p, MAXPATHL))
+		if (GetLongPathName(*fnamep, p, _MAX_PATH))
 		{
 		    vim_free(*bufp);
 		    *bufp = *fnamep = p;
@@ -25061,6 +25082,7 @@ do_string_sub(str, pat, sub, flags)
     int		i;
     int		do_all;
     char_u	*tail;
+    char_u	*end;
     garray_T	ga;
     char_u	*ret;
     char_u	*save_cpo;
@@ -25079,6 +25101,7 @@ do_string_sub(str, pat, sub, flags)
     if (regmatch.regprog != NULL)
     {
 	tail = str;
+	end = str + STRLEN(str);
 	while (vim_regexec_nl(&regmatch, str, (colnr_T)(tail - str)))
 	{
 	    /* Skip empty match except for first match. */
@@ -25105,7 +25128,7 @@ do_string_sub(str, pat, sub, flags)
 	     * - The text after the match.
 	     */
 	    sublen = vim_regsub(&regmatch, sub, tail, FALSE, TRUE, FALSE);
-	    if (ga_grow(&ga, (int)(STRLEN(tail) + sublen -
+	    if (ga_grow(&ga, (int)((end - tail) + sublen -
 			    (regmatch.endp[0] - regmatch.startp[0]))) == FAIL)
 	    {
 		ga_clear(&ga);
